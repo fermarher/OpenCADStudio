@@ -1,0 +1,151 @@
+name: Build macOS Intel
+
+# Compilación no oficial para Mac con procesador Intel.
+# Se lanza a mano desde la pestaña Actions: Run workflow.
+# El .dmg queda como artefacto de la ejecución, listo para descargar.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-macos-intel:
+    runs-on: macos-15-intel    # x86_64 (Intel)
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install librsvg (for rsvg-convert)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install librsvg
+
+      - name: Build
+        env:
+          OCS_PATREON_TOKEN: ${{ secrets.OCS_PATREON_TOKEN }}
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          # The QuickLook extension links libdwg_thumbnailer.a. The staticlib
+          # crate-type is only emitted when the crate is built as a target (as a
+          # plain dependency cargo produces just the rlib), so build it here.
+          cargo build --release --target x86_64-apple-darwin -p dwg-thumbnailer
+
+      - name: Build .icns from SVG
+        run: |
+          mkdir -p OpenCADStudio.iconset
+          # Render all the sizes Apple expects in an .icns.
+          for SIZE in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w $SIZE -h $SIZE assets/logo.svg -o OpenCADStudio.iconset/icon_${SIZE}x${SIZE}.png
+          done
+          # @2x retina variants (half-size base name)
+          for BASE in 16 32 128 256 512; do
+            DOUBLE=$((BASE * 2))
+            cp OpenCADStudio.iconset/icon_${DOUBLE}x${DOUBLE}.png OpenCADStudio.iconset/icon_${BASE}x${BASE}@2x.png
+          done
+          iconutil -c icns OpenCADStudio.iconset -o AppIcon.icns
+
+      - name: Build DWG/DXF document .icns from the same SVG sources
+        run: |
+          # Finder document icons (Info.plist CFBundleTypeIconFile = DWG/DXF),
+          # generated from the single-source mimetype SVGs — never hand-drawn.
+          for T in dwg dxf; do
+            mkdir -p "$T.iconset"
+            for SIZE in 16 32 64 128 256 512 1024; do
+              rsvg-convert -w $SIZE -h $SIZE "assets/mimetypes/image-vnd.$T.svg" \
+                -o "$T.iconset/icon_${SIZE}x${SIZE}.png"
+            done
+            for BASE in 16 32 128 256 512; do
+              cp "$T.iconset/icon_$((BASE*2))x$((BASE*2)).png" \
+                 "$T.iconset/icon_${BASE}x${BASE}@2x.png"
+            done
+            iconutil -c icns "$T.iconset" -o "$(echo "$T" | tr a-z A-Z).icns"
+          done
+
+      - name: Build DWG QuickLook thumbnail extension (.appex)
+        run: |
+          # A QuickLook thumbnail App Extension, built without an Xcode project:
+          # swiftc compiles the provider, links the Rust core static lib (its C
+          # ABI) + the system frameworks, and we hand-assemble the .appex bundle.
+          # `cargo build` already produced libdwg_thumbnailer.a (workspace member,
+          # crate-type staticlib). The whole app is ad-hoc signed below, which
+          # deep-signs the embedded extension too.
+          set -e
+          VERSION="${{ github.ref_name }}"; VERSION="${VERSION#v}"; [ -z "$VERSION" ] && VERSION="0.0.0"
+          EXT=DWGThumbnail.appex
+          rm -rf "$EXT"; mkdir -p "$EXT/Contents/MacOS"
+          swiftc \
+            -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+            -target x86_64-apple-macos11 \
+            -O -parse-as-library -application-extension \
+            -module-name DWGThumbnail \
+            -import-objc-header crates/dwg-thumbnailer/macos/dwg_thumbnailer.h \
+            crates/dwg-thumbnailer/macos/ThumbnailProvider.swift \
+            -L target/x86_64-apple-darwin/release -ldwg_thumbnailer \
+            -framework QuickLookThumbnailing -framework CoreGraphics \
+            -framework ImageIO -framework Foundation -framework Security \
+            -framework SystemConfiguration -liconv \
+            -Xlinker -e -Xlinker _NSExtensionMain \
+            -o "$EXT/Contents/MacOS/DWGThumbnail"
+          sed "s/__VERSION__/$VERSION/g" crates/dwg-thumbnailer/macos/Info.plist > "$EXT/Contents/Info.plist"
+
+      - name: Assemble .app bundle
+        run: |
+          APP=OpenCADStudio.app
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/PlugIns"
+          cp target/x86_64-apple-darwin/release/OpenCADStudio "$APP/Contents/MacOS/OpenCADStudio"
+          chmod +x "$APP/Contents/MacOS/OpenCADStudio"
+          cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cp DWG.icns DXF.icns "$APP/Contents/Resources/"
+          # QuickLook thumbnail extension.
+          cp -R DWGThumbnail.appex "$APP/Contents/PlugIns/"
+          # Substitute version into Info.plist.
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          [ -z "$VERSION" ] && VERSION="0.0.0"
+          sed "s/__VERSION__/$VERSION/g" packaging/Info.plist > "$APP/Contents/Info.plist"
+
+      - name: Ad-hoc code-sign the bundle
+        run: |
+          # No paid Apple Developer ID is available, so the app cannot be
+          # notarised. An *ad-hoc* signature (identity "-") at least gives the
+          # bundle a valid self-signature: this avoids the harshest Gatekeeper
+          # verdict ("app is damaged, Move to Trash") on a quarantined download
+          # and is mandatory anyway for arm64 binaries to execute. Sign the
+          # whole bundle deeply, then verify.
+          codesign --force --deep --sign - --timestamp=none OpenCADStudio.app
+          codesign --verify --strict --verbose=2 OpenCADStudio.app
+
+      - name: Create .dmg
+        run: |
+          # hdiutil intermittently fails with "Resource busy" on the hosted
+          # runner (a stale mount or background indexer holding the image).
+          # Detach any leftover volume and retry a few times before giving up.
+          set +e
+          for attempt in 1 2 3 4 5; do
+            hdiutil detach "/Volumes/Open CAD Studio" >/dev/null 2>&1 || true
+            rm -f OpenCADStudio.dmg
+            hdiutil create \
+              -volname "Open CAD Studio" \
+              -srcfolder OpenCADStudio.app \
+              -ov -format UDZO \
+              OpenCADStudio.dmg && break
+            echo "hdiutil create failed (attempt $attempt) — retrying in 5s"
+            sleep 5
+          done
+          set -e
+          test -f OpenCADStudio.dmg
+
+      - name: Upload .dmg as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCADStudio-macos-x86_64-dmg
+          path: OpenCADStudio.dmg
+          if-no-files-found: error
